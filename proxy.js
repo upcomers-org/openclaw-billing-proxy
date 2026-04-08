@@ -119,7 +119,7 @@ function loadConfig() {
   // macOS Keychain fallback: extract token and write to file
   if (!credsPath && process.platform === 'darwin') {
     const { execSync } = require('child_process');
-    const keychainNames = ['claude-code', 'claude', 'com.anthropic.claude-code'];
+    const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
     for (const svc of keychainNames) {
       try {
         const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
@@ -149,7 +149,7 @@ function loadConfig() {
     console.error('Then run this proxy again.');
     console.error('Searched:', credsPaths.join(', '));
     if (process.platform === 'darwin') {
-      console.error('Also checked macOS Keychain (claude-code, claude, com.anthropic.claude-code)');
+      console.error('Also checked macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code)');
     }
     process.exit(1);
   }
