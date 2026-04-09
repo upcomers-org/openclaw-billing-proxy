@@ -396,11 +396,20 @@ function getToken(credsPath) {
 }
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
+// String-aware bracket matching: skips [/] inside JSON string values so that
+// brackets in tool descriptions or text content don't corrupt the depth count.
 function findMatchingBracket(str, start) {
-  let d = 0;
+  let d = 0, inStr = false;
   for (let i = start; i < str.length; i++) {
-    if (str[i] === '[') d++;
-    else if (str[i] === ']') { d--; if (d === 0) return i; }
+    const c = str[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '[') d++;
+    else if (c === ']') { d--; if (d === 0) return i; }
   }
   return -1;
 }
@@ -428,16 +437,23 @@ function processBody(bodyStr, config) {
   // Strip the OC config section (~28K of ## Tooling, ## Workspace, ## Messaging, etc.)
   // and replace with a brief paraphrase. The config is between the identity line
   // ("You are a personal assistant") and the first workspace doc (AGENTS.md header).
+  // IMPORTANT: Search WITHIN the system array, not from the start of the body.
+  // The identity line can appear in conversation history (from prior discussions),
+  // and matching there instead of the system prompt causes the strip to fail.
   if (config.stripSystemConfig) {
     const IDENTITY_MARKER = 'You are a personal assistant';
-    const configStart = m.indexOf(IDENTITY_MARKER);
+    // Anchor search to the system array so we don't match conversation history
+    const sysArrayStart = m.indexOf('"system":[');
+    const searchFrom = sysArrayStart !== -1 ? sysArrayStart : 0;
+    const configStart = m.indexOf(IDENTITY_MARKER, searchFrom);
     if (configStart !== -1) {
       let stripFrom = configStart;
       if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') {
         stripFrom -= 2;
       }
-      // Find end of config: first workspace doc header (AGENTS.md)
-      const configEnd = m.indexOf('AGENTS.md', configStart);
+      // Find end of config: first workspace doc header containing AGENTS.md
+      // after the identity line. Works on Windows (C:\Users\...) and Linux (/home/...).
+      const configEnd = m.indexOf('AGENTS.md', configStart + IDENTITY_MARKER.length);
       if (configEnd !== -1) {
         // Back up to the \n## before AGENTS.md
         let boundary = configEnd;

@@ -1,5 +1,29 @@
 # Changelog
 
+## v2.2.1 -- 2026-04-09
+
+### Fix system strip and tool description stripping on Linux/macOS
+
+**Changes:**
+- **System strip now anchored to system array.** Previously searched from position 0
+  in the body, matching the identity line in conversation history (from prior discussions
+  about the proxy) instead of the actual system prompt. On bodies with accumulated
+  conversation history, the strip either failed silently or stripped the wrong region.
+  Now searches from `"system":[` forward, guaranteeing it finds the config section in
+  the system prompt.
+- **`findMatchingBracket` is now string-aware.** Previously counted raw `[`/`]` characters
+  including those inside JSON string values (tool descriptions, text content). Brackets
+  like `[optional]` or `[array]` in descriptions corrupted the depth count, causing the
+  tools array boundary to be detected at the wrong position. Tool description stripping
+  then silently failed. Now skips brackets inside quoted strings.
+
+**Impact:** These two bugs made the proxy fail on Linux/macOS (and any setup where
+conversation history contained references to "personal assistant"). The system config
+template (~18-28K) was never stripped, and tool descriptions were never removed,
+leaving enough fingerprint signal for Anthropic's detection to trigger.
+
+---
+
 ## v2.2.0 -- 2026-04-09
 
 ### Docker Compose support + env-var credentials + transfer-encoding fix
