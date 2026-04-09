@@ -318,7 +318,7 @@ function loadConfig() {
   // macOS Keychain fallback
   if (!credsPath && process.platform === 'darwin') {
     const { execSync } = require('child_process');
-    for (const svc of ['claude-code', 'claude', 'com.anthropic.claude-code']) {
+    for (const svc of ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code']) {
       try {
         const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
         if (token) {
@@ -340,7 +340,7 @@ function loadConfig() {
 
   if (!credsPath) {
     console.error('[ERROR] Claude Code credentials not found. Run "claude auth login" first.');
-    if (process.platform === 'darwin') console.error('Also checked macOS Keychain.');
+    if (process.platform === 'darwin') console.error('Also checked macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code).');
     process.exit(1);
   }
 

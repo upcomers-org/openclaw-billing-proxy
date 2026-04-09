@@ -266,10 +266,12 @@ This tests 8 layers independently (credentials, token, API, billing header, trig
 - Ensure every `replacements` entry has a matching `reverseMap` entry
 - Use space-free replacements (e.g., `ocplatform`, NOT `assistant platform`) to avoid breaking filesystem paths
 
-**Empty credentials file on Mac**
-- Some Claude Code versions store tokens in macOS Keychain instead of a file
-- Run `claude -p "test" --max-turns 1` to force credential write
-- Check Keychain: `security find-generic-password -s "claude" -w 2>/dev/null`
+**Empty credentials file on Mac / Keychain credentials**
+- Newer Claude Code versions store tokens in macOS Keychain instead of a file
+- The proxy checks these Keychain service names: `Claude Code-credentials`, `claude-code`, `claude`, `com.anthropic.claude-code`
+- Check manually: `security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null`
+- Run `node setup.js` to auto-extract the Keychain token to `~/.claude/.credentials.json`
+- Run `claude -p "test" --max-turns 1` to force credential write if Keychain is also empty
 
 ## Rollback
 
