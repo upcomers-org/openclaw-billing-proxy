@@ -413,8 +413,74 @@ function loadConfig() {
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
-    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
+    refreshIntervalMs: (config.refreshCheckMinutes || 5) * 60 * 1000,
+    refreshThresholdMs: (config.refreshThresholdMinutes || 30) * 60 * 1000,
+    refreshEnabled: config.refreshEnabled !== false
   };
+}
+
+// ─── Credential Refresh ─────────────────────────────────────────────────────
+// Periodically checks token expiry and refreshes via Claude CLI + Keychain.
+// Claude CLI refreshes the Keychain entry (on macOS) or the credentials file
+// (on Linux), so after triggering it we re-extract from Keychain into the
+// snapshot file the proxy reads from.
+function refreshCredentials(credsPath) {
+  if (credsPath === 'env') return false;
+  const { execSync } = require('child_process');
+
+  // Step 1: Trigger Claude CLI to refresh the underlying credential store
+  try {
+    execSync('claude -p "ping" --max-turns 1 --no-session-persistence', {
+      timeout: 30000,
+      stdio: 'pipe'
+    });
+  } catch(e) {
+    console.error('[PROXY] claude CLI refresh failed: ' + (e.message || 'unknown'));
+    // Continue anyway -- Keychain may still have a fresh token from elsewhere
+  }
+
+  // Step 2: On macOS, re-extract from Keychain into the snapshot file
+  if (process.platform === 'darwin') {
+    for (const svc of ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code']) {
+      try {
+        const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
+        if (!token) continue;
+        let creds;
+        try { creds = JSON.parse(token); } catch(e) {
+          if (token.startsWith('sk-ant-')) creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
+        }
+        if (creds && creds.claudeAiOauth && creds.claudeAiOauth.accessToken) {
+          fs.mkdirSync(path.dirname(credsPath), { recursive: true });
+          fs.writeFileSync(credsPath, JSON.stringify(creds));
+          return true;
+        }
+      } catch(e) {}
+    }
+  }
+
+  // Step 3: Verify file is readable and fresh
+  try { getToken(credsPath); return true; } catch(e) { return false; }
+}
+
+function maybeRefreshCredentials(config) {
+  if (!config.refreshEnabled || config.credsPath === 'env') return;
+  try {
+    const oauth = getToken(config.credsPath);
+    const remainingMs = oauth.expiresAt - Date.now();
+    if (remainingMs > config.refreshThresholdMs) return;
+    const remainingMin = (remainingMs / 60000).toFixed(1);
+    console.log('[PROXY] Token expires in ' + remainingMin + 'm, refreshing...');
+    if (refreshCredentials(config.credsPath)) {
+      const newOauth = getToken(config.credsPath);
+      const newHours = ((newOauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+      console.log('[PROXY] Token refreshed, now expires in ' + newHours + 'h');
+    } else {
+      console.error('[PROXY] Token refresh failed -- run `claude auth login` manually');
+    }
+  } catch(e) {
+    console.error('[PROXY] Refresh check error: ' + e.message);
+  }
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
@@ -862,6 +928,14 @@ function startServer(config) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
     }
   });
+
+  // Periodic credential refresh (only if file-backed, not env-var mode)
+  if (config.refreshEnabled && config.credsPath !== 'env') {
+    const intervalMin = (config.refreshIntervalMs / 60000).toFixed(0);
+    const thresholdMin = (config.refreshThresholdMs / 60000).toFixed(0);
+    console.log(`  Token refresh:     every ${intervalMin}m, when <${thresholdMin}m remaining`);
+    setInterval(() => maybeRefreshCredentials(config), config.refreshIntervalMs);
+  }
 
   process.on('SIGINT', () => process.exit(0));
   process.on('SIGTERM', () => process.exit(0));
