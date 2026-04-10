@@ -46,6 +46,12 @@ const CC_VERSION = '2.1.97';
 const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
 
+// Token refresh defaults (overridable via config.refreshCheckMinutes / refreshThresholdMinutes)
+const DEFAULT_REFRESH_CHECK_MINUTES = 0.25;
+const DEFAULT_REFRESH_THRESHOLD_MINUTES = 2;
+const CLAUDE_CLI_REFRESH_TIMEOUT_MS = 30000;
+const SK_ANT_SYNTHETIC_EXPIRY_MS = 86400000;
+
 // Persistent per-instance identifiers (generated once at startup)
 const DEVICE_ID = crypto.randomBytes(32).toString('hex');
 const INSTANCE_SESSION_ID = crypto.randomUUID();
@@ -348,7 +354,7 @@ function loadConfig() {
         if (token) {
           let creds;
           try { creds = JSON.parse(token); } catch(e) {
-            if (token.startsWith('sk-ant-')) creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
+            if (token.startsWith('sk-ant-')) creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + SK_ANT_SYNTHETIC_EXPIRY_MS, subscriptionType: 'unknown' } };
           }
           if (creds && creds.claudeAiOauth) {
             credsPath = path.join(homeDir, '.claude', '.credentials.json');
@@ -417,8 +423,8 @@ function loadConfig() {
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
-    refreshIntervalMs: (config.refreshCheckMinutes || 5) * 60 * 1000,
-    refreshThresholdMs: (config.refreshThresholdMinutes || 30) * 60 * 1000,
+    refreshIntervalMs: (config.refreshCheckMinutes || DEFAULT_REFRESH_CHECK_MINUTES) * 60 * 1000,
+    refreshThresholdMs: (config.refreshThresholdMinutes || DEFAULT_REFRESH_THRESHOLD_MINUTES) * 60 * 1000,
     refreshEnabled: config.refreshEnabled !== false
   };
 }
@@ -435,7 +441,7 @@ function refreshCredentials(credsPath) {
   // Step 1: Trigger Claude CLI to refresh the underlying credential store
   try {
     execSync('claude -p "ping" --max-turns 1 --no-session-persistence', {
-      timeout: 30000,
+      timeout: CLAUDE_CLI_REFRESH_TIMEOUT_MS,
       stdio: 'pipe'
     });
   } catch(e) {
@@ -451,7 +457,7 @@ function refreshCredentials(credsPath) {
         if (!token) continue;
         let creds;
         try { creds = JSON.parse(token); } catch(e) {
-          if (token.startsWith('sk-ant-')) creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + 86400000, subscriptionType: 'unknown' } };
+          if (token.startsWith('sk-ant-')) creds = { claudeAiOauth: { accessToken: token, expiresAt: Date.now() + SK_ANT_SYNTHETIC_EXPIRY_MS, subscriptionType: 'unknown' } };
         }
         if (creds && creds.claudeAiOauth && creds.claudeAiOauth.accessToken) {
           fs.mkdirSync(path.dirname(credsPath), { recursive: true });
@@ -934,9 +940,9 @@ function startServer(config) {
 
   // Periodic credential refresh (only if file-backed, not env-var mode)
   if (config.refreshEnabled && config.credsPath !== 'env') {
-    const intervalMin = (config.refreshIntervalMs / 60000).toFixed(0);
+    const intervalSec = (config.refreshIntervalMs / 1000).toFixed(0);
     const thresholdMin = (config.refreshThresholdMs / 60000).toFixed(0);
-    console.log(`  Token refresh:     every ${intervalMin}m, when <${thresholdMin}m remaining`);
+    console.log(`  Token refresh:     every ${intervalSec}s, when <${thresholdMin}m remaining`);
     setInterval(() => maybeRefreshCredentials(config), config.refreshIntervalMs);
   }
 
