@@ -46,8 +46,7 @@ const CC_VERSION = '2.1.97';
 const BILLING_HASH_SALT = '59cf53e54c78';
 const BILLING_HASH_INDICES = [4, 7, 20];
 
-// Token refresh defaults (overridable via config.refreshCheckMinutes / refreshThresholdMinutes)
-const DEFAULT_REFRESH_CHECK_MINUTES = 5;
+// Token refresh defaults (overridable via config.refreshThresholdMinutes / refreshRetrySeconds)
 const DEFAULT_REFRESH_THRESHOLD_MINUTES = 2;
 const DEFAULT_REFRESH_RETRY_SECONDS = 15;
 const CLAUDE_CLI_REFRESH_TIMEOUT_MS = 30000;
@@ -424,7 +423,6 @@ function loadConfig() {
     stripToolDescriptions: config.stripToolDescriptions !== false,
     injectCCStubs: config.injectCCStubs !== false,
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
-    refreshIntervalMs: (config.refreshCheckMinutes || DEFAULT_REFRESH_CHECK_MINUTES) * 60 * 1000,
     refreshThresholdMs: (config.refreshThresholdMinutes || DEFAULT_REFRESH_THRESHOLD_MINUTES) * 60 * 1000,
     refreshRetryMs: (config.refreshRetrySeconds || DEFAULT_REFRESH_RETRY_SECONDS) * 1000,
     refreshEnabled: config.refreshEnabled !== false
@@ -949,20 +947,29 @@ function startServer(config) {
     }
   });
 
-  // Periodic credential refresh (only if file-backed, not env-var mode).
-  // After a successful check the next run is scheduled at the normal interval;
-  // after a no-op/failed refresh we retry quickly so we don't miss the window
-  // where Claude CLI will actually rotate the token.
+  // Credential refresh (only if file-backed, not env-var mode).
+  // We don't poll on a fixed cadence -- we read the current expiry and
+  // schedule the next check to fire exactly when the token drops below
+  // the threshold. If that refresh is a no-op (Claude CLI declined to
+  // rotate) we retry quickly until it takes.
   if (config.refreshEnabled && config.credsPath !== 'env') {
-    const intervalMin = (config.refreshIntervalMs / 60000).toFixed(0);
     const thresholdMin = (config.refreshThresholdMs / 60000).toFixed(0);
     const retrySec = (config.refreshRetryMs / 1000).toFixed(0);
-    console.log(`  Token refresh:     every ${intervalMin}m, when <${thresholdMin}m remaining (retry ${retrySec}s on no-op)`);
+    console.log(`  Token refresh:     when <${thresholdMin}m remaining (retry ${retrySec}s on no-op)`);
+    const computeNextDelay = () => {
+      try {
+        const oauth = getToken(config.credsPath);
+        const untilCheck = oauth.expiresAt - Date.now() - config.refreshThresholdMs;
+        return Math.max(untilCheck, 0);
+      } catch(e) {
+        return config.refreshRetryMs;
+      }
+    };
     const scheduleNext = (delay) => setTimeout(() => {
       const result = maybeRefreshCredentials(config);
-      scheduleNext(result === 'retry' ? config.refreshRetryMs : config.refreshIntervalMs);
+      scheduleNext(result === 'retry' ? config.refreshRetryMs : computeNextDelay());
     }, delay).unref();
-    scheduleNext(config.refreshIntervalMs);
+    scheduleNext(computeNextDelay());
   }
 
   process.on('SIGINT', () => process.exit(0));
