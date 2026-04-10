@@ -419,7 +419,10 @@ function loadConfig() {
     stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false,
     refreshIntervalMs: (config.refreshCheckMinutes || 5) * 60 * 1000,
     refreshThresholdMs: (config.refreshThresholdMinutes || 30) * 60 * 1000,
-    refreshEnabled: config.refreshEnabled !== false
+    refreshEnabled: config.refreshEnabled !== false,
+    debugConsole: config.debugConsole === true,
+    logRequestsToFile: config.logRequestsToFile === true,
+    logResponsesToFile: config.logResponsesToFile === true
   };
 }
 
@@ -611,7 +614,9 @@ function processBody(bodyStr, config) {
         // Inject CC tool stubs
         if (config.injectCCStubs) {
           const insertAt = '"tools":['.length;
-          section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + section.slice(insertAt);
+          const suffix = section.slice(insertAt);
+          const comma = suffix.trimStart().startsWith(']') ? '' : ',';
+          section = section.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + comma + suffix;
         }
         m = m.slice(0, toolsIdx) + section + m.slice(toolsEndIdx + 1);
       }
@@ -621,7 +626,9 @@ function processBody(bodyStr, config) {
     const toolsIdx = m.indexOf('"tools":[');
     if (toolsIdx !== -1) {
       const insertAt = toolsIdx + '"tools":['.length;
-      m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + ',' + m.slice(insertAt);
+      const suffix = m.slice(insertAt);
+      const comma = suffix.trimStart().startsWith(']') ? '' : ',';
+      m = m.slice(0, insertAt) + CC_TOOL_STUBS.join(',') + comma + suffix;
     }
   }
 
@@ -630,7 +637,9 @@ function processBody(bodyStr, config) {
   const sysArrayIdx = m.indexOf('"system":[');
   if (sysArrayIdx !== -1) {
     const insertAt = sysArrayIdx + '"system":['.length;
-    m = m.slice(0, insertAt) + BILLING_BLOCK + ',' + m.slice(insertAt);
+    const suffix = m.slice(insertAt);
+    const comma = suffix.trimStart().startsWith(']') ? '' : ',';
+    m = m.slice(0, insertAt) + BILLING_BLOCK + comma + suffix;
   } else if (m.includes('"system":"')) {
     const sysStart = m.indexOf('"system":"');
     let i = sysStart + '"system":"'.length;
@@ -663,7 +672,9 @@ function processBody(bodyStr, config) {
     m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
   } else {
     // Insert after opening brace
-    m = '{' + metaJson + ',' + m.slice(1);
+    const suffix = m.slice(1);
+    const comma = suffix.trimStart().startsWith('}') ? '' : ',';
+    m = '{' + metaJson + comma + suffix;
   }
 
   // Layer 8: Strip trailing assistant prefill (raw string, no JSON.parse)
@@ -817,8 +828,21 @@ function startServer(config) {
       for (const b of REQUIRED_BETAS) { if (!betas.includes(b)) betas.push(b); }
       headers['anthropic-beta'] = betas.join(',');
 
-      const ts = new Date().toISOString().substring(11, 19);
+      const now = new Date();
+      const ts = now.toISOString().substring(11, 19);
+      const dateStr = now.toISOString().substring(0, 10);
+
       console.log(`[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)`);
+      if (config.debugConsole) {
+        console.log(`[${ts}] #${reqNum} Request Headers:\n`, JSON.stringify(headers, null, 2));
+        console.log(`[${ts}] #${reqNum} Request Body:\n`, bodyStr);
+      }
+
+      if (config.logRequestsToFile) {
+        const logFile = `anthropic_requests_${dateStr}.log`;
+        const logContent = `----------------------------------------\n[${ts}] #${reqNum} ${req.method} ${req.url} (${originalSize}b -> ${body.length}b)\nHeaders: ${JSON.stringify(headers, null, 2)}\nBody:\n${bodyStr}\n`;
+        fs.appendFile(logFile, logContent, (err) => { if (err) console.error('Failed to write log:', err); });
+      }
 
       const upstream = https.request({
         hostname: UPSTREAM_HOST, port: 443,
@@ -838,6 +862,13 @@ function startServer(config) {
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(errBody);
+            
+            if (config.logResponsesToFile) {
+              const respLogFile = `anthropic_responses_${dateStr}.log`;
+              const logContent = `----------------------------------------\n[${ts}] #${reqNum} ERROR RESPONSE (${status})\n${errBody}\n`;
+              fs.appendFile(respLogFile, logContent, (err) => { if (err) console.error('Failed to log error response:', err); });
+            }
+
             res.writeHead(status, nh);
             res.end(errBody);
           });
@@ -857,7 +888,9 @@ function startServer(config) {
           // emoji, etc.) lands on a chunk boundary.
           const decoder = new StringDecoder('utf8');
           let pending = '';
+          const sseChunks = [];
           upRes.on('data', (chunk) => {
+            sseChunks.push(chunk);
             pending += decoder.write(chunk);
             if (pending.length > TAIL_SIZE) {
               let sliceIdx = pending.length - TAIL_SIZE;
@@ -877,6 +910,14 @@ function startServer(config) {
               res.write(reverseMap(pending, config));
             }
             res.end();
+
+            const fullSseBody = Buffer.concat(sseChunks).toString();
+            const reversedSseBody = reverseMap(fullSseBody, config);
+            if (config.logResponsesToFile) {
+              const respLogFile = `anthropic_responses_${dateStr}.log`;
+              const logContent = `----------------------------------------\n[${ts}] #${reqNum} SSE RESPONSE (${status})\n${reversedSseBody}\n`;
+              fs.appendFile(respLogFile, logContent, (err) => { if (err) console.error('Failed to log SSE response:', err); });
+            }
           });
         } else {
           const respChunks = [];
@@ -887,6 +928,13 @@ function startServer(config) {
             const nh = { ...upRes.headers };
             delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(respBody);
+
+            if (config.logResponsesToFile) {
+              const respLogFile = `anthropic_responses_${dateStr}.log`;
+              const logContent = `----------------------------------------\n[${ts}] #${reqNum} JSON RESPONSE (${status})\n${respBody}\n`;
+              fs.appendFile(respLogFile, logContent, (err) => { if (err) console.error('Failed to log JSON response:', err); });
+            }
+
             res.writeHead(status, nh);
             res.end(respBody);
           });
