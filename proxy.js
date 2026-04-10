@@ -28,23 +28,35 @@ const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const crypto = require('crypto');
+const { StringDecoder } = require('string_decoder');
 
 // ─── Defaults ───────────────────────────────────────────────────────────────
 const DEFAULT_PORT = 18801;
 const UPSTREAM_HOST = 'api.anthropic.com';
-const VERSION = '2.0.0';
+const VERSION = '2.2.3';
 
-// Claude Code billing identifier -- injected into the system prompt
-const BILLING_BLOCK = '{"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.80.a46; cc_entrypoint=sdk-cli; cch=00000;"}';
+// Claude Code version to emulate (update when new CC versions are released)
+const CC_VERSION = '2.1.97';
+
+// Billing fingerprint constants (matches real CC utils/fingerprint.ts)
+const BILLING_HASH_SALT = '59cf53e54c78';
+const BILLING_HASH_INDICES = [4, 7, 20];
+
+// Persistent per-instance identifiers (generated once at startup)
+const DEVICE_ID = crypto.randomBytes(32).toString('hex');
+const INSTANCE_SESSION_ID = crypto.randomUUID();
 
 // Beta flags required for OAuth + Claude Code features
 const REQUIRED_BETAS = [
-  'claude-code-20250219',
   'oauth-2025-04-20',
+  'claude-code-20250219',
   'interleaved-thinking-2025-05-14',
+  'advanced-tool-use-2025-11-20',
   'context-management-2025-06-27',
   'prompt-caching-scope-2026-01-05',
-  'effort-2025-11-24'
+  'effort-2025-11-24',
+  'fast-mode-2026-02-01'
 ];
 
 // CC tool stubs -- injected into tools array to make the tool set look more
@@ -56,6 +68,89 @@ const CC_TOOL_STUBS = [
   '{"name":"NotebookEdit","description":"Edit notebook cells","input_schema":{"type":"object","properties":{"notebook_path":{"type":"string"},"cell_index":{"type":"integer"}},"required":["notebook_path"]}}',
   '{"name":"TodoRead","description":"Read current task list","input_schema":{"type":"object","properties":{}}}'
 ];
+
+// ─── Billing Fingerprint ────────────────────────────────────────────────────
+// Computes a 3-character SHA256 fingerprint hash matching real CC's
+// computeFingerprint() in utils/fingerprint.ts:
+//   SHA256(salt + msg[4] + msg[7] + msg[20] + version)[:3]
+// Applied to the first user message text in the request body.
+
+function computeBillingFingerprint(firstUserText) {
+  const chars = BILLING_HASH_INDICES.map(i => firstUserText[i] || '0').join('');
+  const input = `${BILLING_HASH_SALT}${chars}${CC_VERSION}`;
+  return crypto.createHash('sha256').update(input).digest('hex').slice(0, 3);
+}
+
+// Extract first user message text from the raw body using string scanning.
+// Avoids JSON.parse to preserve raw body integrity.
+function extractFirstUserText(bodyStr) {
+  // Find first "role":"user" in messages array
+  const msgsIdx = bodyStr.indexOf('"messages":[');
+  if (msgsIdx === -1) return '';
+  const userIdx = bodyStr.indexOf('"role":"user"', msgsIdx);
+  if (userIdx === -1) return '';
+
+  // Look for "content" near this role
+  // Could be "content":"string" or "content":[{..."text":"..."}]
+  const contentIdx = bodyStr.indexOf('"content"', userIdx);
+  if (contentIdx === -1 || contentIdx > userIdx + 500) return '';
+
+  const afterContent = bodyStr[contentIdx + '"content"'.length + 1]; // skip the :
+  if (afterContent === '"') {
+    // Simple string content: "content":"text here"
+    const textStart = contentIdx + '"content":"'.length;
+    let end = textStart;
+    while (end < bodyStr.length) {
+      if (bodyStr[end] === '\\') { end += 2; continue; }
+      if (bodyStr[end] === '"') break;
+      end++;
+    }
+    // Decode basic JSON escapes for the fingerprint characters
+    return bodyStr.slice(textStart, end)
+      .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+  }
+  // Array content: find first text block
+  const textIdx = bodyStr.indexOf('"text":"', contentIdx);
+  if (textIdx === -1 || textIdx > contentIdx + 2000) return '';
+  const textStart = textIdx + '"text":"'.length;
+  let end = textStart;
+  while (end < bodyStr.length) {
+    if (bodyStr[end] === '\\') { end += 2; continue; }
+    if (bodyStr[end] === '"') break;
+    end++;
+  }
+  return bodyStr.slice(textStart, Math.min(end, textStart + 50))
+    .replace(/\\n/g, '\n').replace(/\\t/g, '\t').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+}
+
+function buildBillingBlock(bodyStr) {
+  const firstText = extractFirstUserText(bodyStr);
+  const fingerprint = computeBillingFingerprint(firstText);
+  const ccVersion = `${CC_VERSION}.${fingerprint}`;
+  return `{"type":"text","text":"x-anthropic-billing-header: cc_version=${ccVersion}; cc_entrypoint=cli; cch=00000;"}`;
+}
+
+// ─── Stainless SDK Headers ──────────────────────────────────────────────────
+// Real Claude Code sends these on every request via the Anthropic JS SDK.
+function getStainlessHeaders() {
+  const p = process.platform;
+  const osName = p === 'darwin' ? 'macOS' : p === 'win32' ? 'Windows' : p === 'linux' ? 'Linux' : p;
+  const arch = process.arch === 'x64' ? 'x64' : process.arch === 'arm64' ? 'arm64' : process.arch;
+  return {
+    'user-agent': `claude-cli/${CC_VERSION} (external, cli)`,
+    'x-app': 'cli',
+    'x-claude-code-session-id': INSTANCE_SESSION_ID,
+    'x-stainless-arch': arch,
+    'x-stainless-lang': 'js',
+    'x-stainless-os': osName,
+    'x-stainless-package-version': '0.81.0',
+    'x-stainless-runtime': 'node',
+    'x-stainless-runtime-version': process.version,
+    'x-stainless-retry-count': '0',
+    'x-stainless-timeout': '600',
+    'anthropic-dangerous-direct-browser-access': 'true'
+  };
+}
 
 // ─── Layer 2: String Trigger Replacements ───────────────────────────────────
 // Applied globally via split/join on the entire request body.
@@ -123,8 +218,17 @@ const DEFAULT_TOOL_RENAMES = [
   ['session_status', 'StatusCheck'],
   ['web_search', 'WebSearch'],
   ['web_fetch', 'WebFetch'],
-  ['image', 'ImageGen'],
+  // NOTE: ['image', 'ImageGen'] removed — collides with Anthropic content block
+  // type "image". OpenClaw tool_results carrying image content blocks would have
+  // their `"type": "image"` field renamed and Anthropic rejects with:
+  //   messages.N.content.M.tool_result.content.K: Input tag 'ImageGen' found
+  //   using 'type' does not match any of the expected tags
+  // The fingerprint signal lost from one tool name is much smaller than the
+  // certainty of breaking every conversation that ever touched an image. (issue #14)
   ['pdf', 'PdfParse'],
+  ['image_generate', 'ImageCreate'],
+  ['music_generate', 'MusicCreate'],
+  ['video_generate', 'VideoCreate'],
   ['memory_search', 'KnowledgeSearch'],
   ['memory_get', 'KnowledgeGet'],
   ['lcm_expand_query', 'ContextQuery'],
@@ -183,43 +287,59 @@ const DEFAULT_REVERSE_MAP = [
 
 // ─── Configuration ──────────────────────────────────────────────────────────
 function loadConfig() {
+  // Port precedence: PROXY_PORT env > --port CLI > config.json port > DEFAULT_PORT
   const args = process.argv.slice(2);
   let configPath = null;
-  let port = DEFAULT_PORT;
+  let cliPort = null;
 
   for (let i = 0; i < args.length; i++) {
-    if (args[i] === '--port' && args[i + 1]) port = parseInt(args[i + 1]);
+    if (args[i] === '--port' && args[i + 1]) cliPort = parseInt(args[i + 1]);
     if (args[i] === '--config' && args[i + 1]) configPath = args[i + 1];
   }
 
+  const envPort = process.env.PROXY_PORT ? parseInt(process.env.PROXY_PORT) : null;
+
   let config = {};
   if (configPath && fs.existsSync(configPath)) {
-    config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+    try { config = JSON.parse(fs.readFileSync(configPath, 'utf8')); } catch(e) {
+      console.error('[ERROR] Failed to parse config: ' + configPath + ' (' + e.message + ')');
+      process.exit(1);
+    }
   } else if (fs.existsSync('config.json')) {
-    config = JSON.parse(fs.readFileSync('config.json', 'utf8'));
+    try { config = JSON.parse(fs.readFileSync('config.json', 'utf8')); } catch(e) {
+      console.error('[PROXY] Warning: config.json is invalid, using defaults. (' + e.message + ')');
+    }
   }
 
   const homeDir = os.homedir();
+
+  // OAUTH_TOKEN env var takes precedence over all file-based credentials (useful for Docker)
+  let credsPath = null;
+  if (process.env.OAUTH_TOKEN) {
+    credsPath = 'env';
+    console.log('[PROXY] Using OAUTH_TOKEN from environment variable.');
+  }
+
   const credsPaths = [
     config.credentialsPath,
     path.join(homeDir, '.claude', '.credentials.json'),
     path.join(homeDir, '.claude', 'credentials.json')
   ].filter(Boolean);
 
-  let credsPath = null;
-  for (const p of credsPaths) {
-    const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
-    if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
-      credsPath = resolved;
-      break;
+  if (!credsPath) {
+    for (const p of credsPaths) {
+      const resolved = p.startsWith('~') ? path.join(homeDir, p.slice(1)) : p;
+      if (fs.existsSync(resolved) && fs.statSync(resolved).size > 0) {
+        credsPath = resolved;
+        break;
+      }
     }
   }
 
   // macOS Keychain fallback
   if (!credsPath && process.platform === 'darwin') {
     const { execSync } = require('child_process');
-    const keychainNames = ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code'];
-    for (const svc of keychainNames) {
+    for (const svc of ['Claude Code-credentials', 'claude-code', 'claude', 'com.anthropic.claude-code']) {
       try {
         const token = execSync('security find-generic-password -s "' + svc + '" -w 2>/dev/null', { encoding: 'utf8' }).trim();
         if (token) {
@@ -242,30 +362,69 @@ function loadConfig() {
   if (!credsPath) {
     console.error('[ERROR] Claude Code credentials not found.');
     console.error('Run "claude auth login" first to authenticate.');
-    console.error('On macOS, try: claude -p "test" --max-turns 1 --no-session-persistence');
-    console.error('Then run this proxy again.');
     console.error('Searched:', credsPaths.join(', '));
-    if (process.platform === 'darwin') {
-      console.error('Also checked macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code)');
-    }
+    if (process.platform === 'darwin') console.error('Also checked macOS Keychain (Claude Code-credentials, claude-code, claude, com.anthropic.claude-code).');
+    console.error('For Docker: set OAUTH_TOKEN in .env or mount ~/.claude as a volume.');
     process.exit(1);
   }
 
+  // Merge pattern arrays: defaults first, then config additions/overrides.
+  // This prevents stale config.json snapshots (from old setup.js runs) from
+  // silently masking new default patterns added in proxy updates. (issue #24)
+  // Users who want full manual control can set "mergeDefaults": false.
+  function mergePatterns(defaults, overrides) {
+    if (!overrides || overrides.length === 0) return defaults;
+    const merged = new Map();
+    for (const [find, replace] of defaults) merged.set(find, replace);
+    for (const [find, replace] of overrides) merged.set(find, replace);
+    return [...merged.entries()];
+  }
+
+  const useDefaults = config.mergeDefaults !== false;
+
+  const replacements = useDefaults
+    ? mergePatterns(DEFAULT_REPLACEMENTS, config.replacements)
+    : (config.replacements || DEFAULT_REPLACEMENTS);
+  const reverseMap = useDefaults
+    ? mergePatterns(DEFAULT_REVERSE_MAP, config.reverseMap)
+    : (config.reverseMap || DEFAULT_REVERSE_MAP);
+  const toolRenames = useDefaults
+    ? mergePatterns(DEFAULT_TOOL_RENAMES, config.toolRenames)
+    : (config.toolRenames || DEFAULT_TOOL_RENAMES);
+  const propRenames = useDefaults
+    ? mergePatterns(DEFAULT_PROP_RENAMES, config.propRenames)
+    : (config.propRenames || DEFAULT_PROP_RENAMES);
+
+  // Warn if config has stale arrays that were merged
+  if (config.replacements && useDefaults && config.replacements.length < DEFAULT_REPLACEMENTS.length) {
+    console.log(`[PROXY] Note: config.json has ${config.replacements.length} replacements, merged with ${DEFAULT_REPLACEMENTS.length} defaults -> ${replacements.length} total`);
+  }
+  if (config.toolRenames && useDefaults && config.toolRenames.length < DEFAULT_TOOL_RENAMES.length) {
+    console.log(`[PROXY] Note: config.json has ${config.toolRenames.length} toolRenames, merged with ${DEFAULT_TOOL_RENAMES.length} defaults -> ${toolRenames.length} total`);
+  }
+
   return {
-    port: config.port || port,
+    port: envPort || cliPort || config.port || DEFAULT_PORT,
     credsPath,
-    replacements: config.replacements || DEFAULT_REPLACEMENTS,
-    reverseMap: config.reverseMap || DEFAULT_REVERSE_MAP,
-    toolRenames: config.toolRenames || DEFAULT_TOOL_RENAMES,
-    propRenames: config.propRenames || DEFAULT_PROP_RENAMES,
+    replacements,
+    reverseMap,
+    toolRenames,
+    propRenames,
     stripSystemConfig: config.stripSystemConfig !== false,
     stripToolDescriptions: config.stripToolDescriptions !== false,
-    injectCCStubs: config.injectCCStubs !== false
+    injectCCStubs: config.injectCCStubs !== false,
+    stripTrailingAssistantPrefill: config.stripTrailingAssistantPrefill !== false
   };
 }
 
 // ─── Token Management ───────────────────────────────────────────────────────
 function getToken(credsPath) {
+  // Env var mode: return synthetic OAuth object without file I/O
+  if (credsPath === 'env') {
+    const token = process.env.OAUTH_TOKEN;
+    if (!token) throw new Error('OAUTH_TOKEN env var is empty.');
+    return { accessToken: token, expiresAt: Infinity, subscriptionType: 'env-var' };
+  }
   let raw = fs.readFileSync(credsPath, 'utf8');
   if (raw.charCodeAt(0) === 0xFEFF) raw = raw.slice(1);
   const creds = JSON.parse(raw);
@@ -275,11 +434,20 @@ function getToken(credsPath) {
 }
 
 // ─── Helper ─────────────────────────────────────────────────────────────────
+// String-aware bracket matching: skips [/] inside JSON string values so that
+// brackets in tool descriptions or text content don't corrupt the depth count.
 function findMatchingBracket(str, start) {
-  let d = 0;
+  let d = 0, inStr = false;
   for (let i = start; i < str.length; i++) {
-    if (str[i] === '[') d++;
-    else if (str[i] === ']') { d--; if (d === 0) return i; }
+    const c = str[i];
+    if (inStr) {
+      if (c === '\\') { i++; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '[') d++;
+    else if (c === ']') { d--; if (d === 0) return i; }
   }
   return -1;
 }
@@ -307,25 +475,30 @@ function processBody(bodyStr, config) {
   // Strip the OC config section (~28K of ## Tooling, ## Workspace, ## Messaging, etc.)
   // and replace with a brief paraphrase. The config is between the identity line
   // ("You are a personal assistant") and the first workspace doc (AGENTS.md header).
+  // IMPORTANT: Search WITHIN the system array, not from the start of the body.
+  // The identity line can appear in conversation history (from prior discussions),
+  // and matching there instead of the system prompt causes the strip to fail.
   if (config.stripSystemConfig) {
     const IDENTITY_MARKER = 'You are a personal assistant';
-    const configStart = m.indexOf(IDENTITY_MARKER);
+    // Anchor search to the system array so we don't match conversation history
+    const sysArrayStart = m.indexOf('"system":[');
+    const searchFrom = sysArrayStart !== -1 ? sysArrayStart : 0;
+    const configStart = m.indexOf(IDENTITY_MARKER, searchFrom);
     if (configStart !== -1) {
       let stripFrom = configStart;
       if (stripFrom >= 2 && m[stripFrom - 2] === '\\' && m[stripFrom - 1] === 'n') {
         stripFrom -= 2;
       }
-      // Find end of config: first workspace doc header (AGENTS.md)
-      const configEnd = m.indexOf('AGENTS.md', configStart);
+      // Find end of config: first workspace doc header (a ## section with a filesystem path).
+      // Previous approach used 'AGENTS.md' as the landmark, but that string can appear
+      // earlier in skill content or LCM summaries, causing a premature boundary. (issue #26)
+      // Workspace doc headers always start with a filesystem path:
+      //   Linux/macOS: \n## /home/... or \n## /Users/...
+      //   Windows:     \n## C:\\...
+      let configEnd = m.indexOf('\\n## /', configStart + IDENTITY_MARKER.length);
+      if (configEnd === -1) configEnd = m.indexOf('\\n## C:\\\\', configStart + IDENTITY_MARKER.length);
       if (configEnd !== -1) {
-        // Back up to the \n## before AGENTS.md
-        let boundary = configEnd;
-        for (let i = configEnd - 1; i > stripFrom; i--) {
-          if (m[i] === '#' && m[i - 1] === '#' && i >= 3 && m[i - 3] === '\\' && m[i - 2] === 'n') {
-            boundary = i - 3;
-            break;
-          }
-        }
+        const boundary = configEnd;
 
         const strippedLen = boundary - stripFrom;
         if (strippedLen > 1000) {
@@ -383,7 +556,8 @@ function processBody(bodyStr, config) {
     }
   }
 
-  // Layer 1: Billing header injection
+  // Layer 1: Billing header injection (dynamic fingerprint per request)
+  const BILLING_BLOCK = buildBillingBlock(m);
   const sysArrayIdx = m.indexOf('"system":[');
   if (sysArrayIdx !== -1) {
     const insertAt = sysArrayIdx + '"system":['.length;
@@ -405,19 +579,89 @@ function processBody(bodyStr, config) {
     m = '{"system":[' + BILLING_BLOCK + '],' + m.slice(1);
   }
 
+  // Metadata injection: device_id + session_id matching real CC format
+  // Uses raw string manipulation to inject/replace metadata field
+  const metaValue = JSON.stringify({ device_id: DEVICE_ID, session_id: INSTANCE_SESSION_ID });
+  const metaJson = '"metadata":{"user_id":' + JSON.stringify(metaValue) + '}';
+  const existingMeta = m.indexOf('"metadata":{');
+  if (existingMeta !== -1) {
+    // Find end of existing metadata object
+    let depth = 0, mi = existingMeta + '"metadata":'.length;
+    for (; mi < m.length; mi++) {
+      if (m[mi] === '{') depth++;
+      else if (m[mi] === '}') { depth--; if (depth === 0) { mi++; break; } }
+    }
+    m = m.slice(0, existingMeta) + metaJson + m.slice(mi);
+  } else {
+    // Insert after opening brace
+    m = '{' + metaJson + ',' + m.slice(1);
+  }
+
+  // Layer 8: Strip trailing assistant prefill (raw string, no JSON.parse)
+  // Opus 4.6 disabled assistant message prefill. OpenClaw sometimes pre-fills the
+  // next assistant turn to resume interrupted responses, causing permanent 400
+  // errors ("This model does not support assistant message prefill"). The error is
+  // permanent for the affected session — every retry includes the same prefill.
+  // Fix: forward-scan the messages array with string-aware bracket matching,
+  // then pop trailing assistant messages until the array ends with a user message.
+  if (config.stripTrailingAssistantPrefill !== false) {
+    const msgsIdx = m.indexOf('"messages":[');
+    if (msgsIdx !== -1) {
+      const arrayStart = msgsIdx + '"messages":['.length;
+      const positions = [];
+      let depth = 0, inString = false, objStart = -1;
+      for (let i = arrayStart; i < m.length; i++) {
+        const c = m[i];
+        if (inString) {
+          if (c === '\\') { i++; continue; }
+          if (c === '"') inString = false;
+          continue;
+        }
+        if (c === '"') { inString = true; continue; }
+        if (c === '{') { if (depth === 0) objStart = i; depth++; }
+        else if (c === '}') { depth--; if (depth === 0 && objStart !== -1) { positions.push({ start: objStart, end: i }); objStart = -1; } }
+        else if (c === ']' && depth === 0) break;
+      }
+      let popped = 0;
+      while (positions.length > 0) {
+        const last = positions[positions.length - 1];
+        const obj = m.slice(last.start, last.end + 1);
+        if (!obj.includes('"role":"assistant"')) break;
+        let stripFrom = last.start;
+        for (let i = last.start - 1; i >= arrayStart; i--) {
+          if (m[i] === ',') { stripFrom = i; break; }
+          if (m[i] !== ' ' && m[i] !== '\n' && m[i] !== '\r' && m[i] !== '\t') break;
+        }
+        m = m.slice(0, stripFrom) + m.slice(last.end + 1);
+        positions.pop();
+        popped++;
+      }
+      if (popped > 0) {
+        console.log(`[STRIP-PREFILL] Removed ${popped} trailing assistant message(s)`);
+      }
+    }
+  }
+
   return m;
 }
 
 // ─── Response Processing ────────────────────────────────────────────────────
 function reverseMap(text, config) {
   let r = text;
-  // Reverse tool names first (more specific patterns)
+  // Reverse tool names first (more specific patterns).
+  // Handle BOTH plain ("Name") AND escaped (\"Name\") forms.
+  // SSE input_json_delta embeds tool args in a partial_json string field where
+  // inner quotes are escaped. Without the escaped variant, renamed arg keys
+  // like \"SendMessage\" never get reverted to \"message\" and OpenClaw's tool
+  // runtime fails with "message required". (issue #11)
   for (const [orig, cc] of config.toolRenames) {
     r = r.split('"' + cc + '"').join('"' + orig + '"');
+    r = r.split('\\"' + cc + '\\"').join('\\"' + orig + '\\"');
   }
-  // Reverse property names
+  // Reverse property names — same dual handling
   for (const [orig, renamed] of config.propRenames) {
     r = r.split('"' + renamed + '"').join('"' + orig + '"');
+    r = r.split('\\"' + renamed + '\\"').join('\\"' + orig + '\\"');
   }
   // Reverse string replacements
   for (const [sanitized, original] of config.reverseMap) {
@@ -443,7 +687,7 @@ function startServer(config) {
           version: VERSION,
           requestsServed: requestCount,
           uptime: Math.floor((Date.now() - startedAt) / 1000) + 's',
-          tokenExpiresInHours: expiresIn.toFixed(1),
+          tokenExpiresInHours: isFinite(expiresIn) ? expiresIn.toFixed(1) : 'n/a',
           subscriptionType: oauth.subscriptionType,
           layers: {
             stringReplacements: config.replacements.length,
@@ -484,12 +728,20 @@ function startServer(config) {
       for (const [key, value] of Object.entries(req.headers)) {
         const lk = key.toLowerCase();
         if (lk === 'host' || lk === 'connection' || lk === 'authorization' ||
-            lk === 'x-api-key' || lk === 'content-length') continue;
+            lk === 'x-api-key' || lk === 'content-length' ||
+            lk === 'x-session-affinity') continue; // strip non-CC headers
         headers[key] = value;
       }
       headers['authorization'] = `Bearer ${oauth.accessToken}`;
       headers['content-length'] = body.length;
       headers['accept-encoding'] = 'identity';
+      headers['anthropic-version'] = '2023-06-01';
+
+      // Inject Stainless SDK + Claude Code identity headers
+      const ccHeaders = getStainlessHeaders();
+      for (const [k, v] of Object.entries(ccHeaders)) {
+        headers[k] = v;
+      }
 
       const existingBeta = headers['anthropic-beta'] || '';
       const betas = existingBeta ? existingBeta.split(',').map(b => b.trim()) : [];
@@ -515,16 +767,48 @@ function startServer(config) {
             }
             errBody = reverseMap(errBody, config);
             const nh = { ...upRes.headers };
+            delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(errBody);
             res.writeHead(status, nh);
             res.end(errBody);
           });
           return;
         }
+        // SSE streaming — tail-buffer reverseMap to handle patterns split across
+        // TCP chunk boundaries. Without this, "ocplatform" can split as "ocp"+"latform"
+        // and leak through. TAIL_SIZE >= longest reverseMap pattern. (issue #11)
         if (upRes.headers['content-type'] && upRes.headers['content-type'].includes('text/event-stream')) {
-          res.writeHead(status, upRes.headers);
-          upRes.on('data', chunk => res.write(reverseMap(chunk.toString(), config)));
-          upRes.on('end', () => res.end());
+          const sseHeaders = { ...upRes.headers };
+          delete sseHeaders['content-length'];      // SSE is streamed, no fixed length
+          delete sseHeaders['transfer-encoding'];   // avoid header conflicts
+          res.writeHead(status, sseHeaders);
+          const TAIL_SIZE = 64;
+          // StringDecoder buffers incomplete UTF-8 sequences across TCP chunks.
+          // chunk.toString() would emit U+FFFD whenever a multi-byte char (中文,
+          // emoji, etc.) lands on a chunk boundary.
+          const decoder = new StringDecoder('utf8');
+          let pending = '';
+          upRes.on('data', (chunk) => {
+            pending += decoder.write(chunk);
+            if (pending.length > TAIL_SIZE) {
+              let sliceIdx = pending.length - TAIL_SIZE;
+              // Don't cut between a UTF-16 surrogate pair (4-byte UTF-8 chars
+              // like emoji), or flushable would end with a lone high surrogate
+              // that the downstream client can't recombine.
+              const prev = pending.charCodeAt(sliceIdx - 1);
+              if (prev >= 0xD800 && prev <= 0xDBFF) sliceIdx -= 1;
+              const flushable = pending.slice(0, sliceIdx);
+              pending = pending.slice(sliceIdx);
+              res.write(reverseMap(flushable, config));
+            }
+          });
+          upRes.on('end', () => {
+            pending += decoder.end();
+            if (pending.length > 0) {
+              res.write(reverseMap(pending, config));
+            }
+            res.end();
+          });
         } else {
           const respChunks = [];
           upRes.on('data', c => respChunks.push(c));
@@ -532,6 +816,7 @@ function startServer(config) {
             let respBody = Buffer.concat(respChunks).toString();
             respBody = reverseMap(respBody, config);
             const nh = { ...upRes.headers };
+            delete nh['transfer-encoding']; // avoid conflict with content-length
             nh['content-length'] = Buffer.byteLength(respBody);
             res.writeHead(status, nh);
             res.end(respBody);
@@ -550,23 +835,29 @@ function startServer(config) {
     });
   });
 
-  server.listen(config.port, '127.0.0.1', () => {
+  const bindHost = process.env.PROXY_HOST || '127.0.0.1';
+  server.listen(config.port, bindHost, () => {
     try {
       const oauth = getToken(config.credsPath);
-      const h = ((oauth.expiresAt - Date.now()) / 3600000).toFixed(1);
+      const expiresIn = (oauth.expiresAt - Date.now()) / 3600000;
+      const h = isFinite(expiresIn) ? expiresIn.toFixed(1) + 'h' : 'n/a (env var)';
       console.log(`\n  OpenClaw Billing Proxy v${VERSION}`);
       console.log(`  ─────────────────────────────`);
       console.log(`  Port:              ${config.port}`);
+      console.log(`  Bind address:      ${bindHost}`);
+      console.log(`  Emulating:         Claude Code v${CC_VERSION}`);
       console.log(`  Subscription:      ${oauth.subscriptionType}`);
-      console.log(`  Token expires:     ${h}h`);
+      console.log(`  Token expires:     ${h}`);
       console.log(`  String patterns:   ${config.replacements.length} sanitize + ${config.reverseMap.length} reverse`);
       console.log(`  Tool renames:      ${config.toolRenames.length} (bidirectional)`);
       console.log(`  Property renames:  ${config.propRenames.length} (bidirectional)`);
       console.log(`  CC tool stubs:     ${config.injectCCStubs ? CC_TOOL_STUBS.length : 'disabled'}`);
       console.log(`  System strip:      ${config.stripSystemConfig ? 'enabled' : 'disabled'}`);
       console.log(`  Description strip: ${config.stripToolDescriptions ? 'enabled' : 'disabled'}`);
+      console.log(`  Billing hash:      dynamic (SHA256 fingerprint)`);
+      console.log(`  CC headers:        Stainless SDK + identity`);
       console.log(`  Credentials:       ${config.credsPath}`);
-      console.log(`\n  Ready. Set openclaw.json baseUrl to http://127.0.0.1:${config.port}\n`);
+      console.log(`\n  Ready. Set openclaw.json baseUrl to http://${bindHost}:${config.port}\n`);
     } catch (e) {
       console.error(`  Started on port ${config.port} but credentials error: ${e.message}`);
     }

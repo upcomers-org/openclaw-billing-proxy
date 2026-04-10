@@ -74,7 +74,7 @@ node proxy.js
 
 ## OpenClaw Configuration
 
-Add a `models.providers.anthropic` section to `~/.openclaw/openclaw.json` with a `baseUrl` pointing to the proxy and a `models` array listing the Anthropic models you use:
+Add or update the `models.providers.anthropic` section in `~/.openclaw/openclaw.json` with a `baseUrl` pointing to the proxy and a `models` array listing the Anthropic models you use:
 
 ```json
 {
@@ -93,13 +93,16 @@ Add a `models.providers.anthropic` section to `~/.openclaw/openclaw.json` with a
 }
 ```
 
-**Important:** The `models` array is required by OpenClaw's config schema -- omitting it will cause a validation error. Only include models you actually use.
-
-After updating, restart your OpenClaw gateway for the changes to take effect.
+**Important notes:**
+- The `models` array is required by OpenClaw's config schema -- omitting it will cause a validation error. Only include models you actually use.
+- The `baseUrl` field is the ONLY mechanism that routes OpenClaw traffic through the proxy. Environment variables like `ANTHROPIC_BASE_URL` do NOT control OpenClaw's routing.
+- If you have a direct Anthropic API key in your auth profiles (`~/.openclaw/agents/*/agent/auth-profiles.json`), OpenClaw may prefer that over OAuth and bypass the proxy entirely. Remove or disable the API key auth profile to ensure all traffic goes through the proxy.
+- After updating, restart your OpenClaw gateway for the changes to take effect.
+- Run `node troubleshoot.js` to verify the proxy is working AND that OpenClaw is pointed at it.
 
 ### Rollback
 
-To stop using the proxy, remove the `models.providers` section (or change `baseUrl` back to `https://api.anthropic.com`) and restart the gateway.
+To stop using the proxy, change `baseUrl` back to `https://api.anthropic.com` (or remove the `models.providers` section entirely) and restart the gateway.
 
 ## Proxy Configuration
 
@@ -157,6 +160,38 @@ If your OpenClaw version has additional `sessions_*` tools (they add new ones ac
 If you have a custom assistant name that Anthropic blocks (test by checking if requests fail with the name present but pass without it), add it the same way.
 
 ## Running as a Service
+
+### Docker
+
+```bash
+# Start the proxy (uses ~/.claude credentials by default)
+docker compose up -d
+
+# Verify
+curl http://127.0.0.1:18801/health
+```
+
+**With an OAuth token instead of credential file:**
+```bash
+# Copy and edit the environment file
+cp .env.example .env
+# Set OAUTH_TOKEN in .env
+
+docker compose up -d
+```
+
+**Custom port:**
+```bash
+PROXY_PORT=9000 docker compose up -d
+```
+
+**Custom replacement rules:**
+
+Uncomment the `config.json` volume mount in `docker-compose.yml`, then create a `config.json` (copy from `config.example.json` and edit).
+
+See `.env.example` for all available environment variables.
+
+> **Note:** macOS Keychain credential extraction does not work inside Docker. Use the `~/.claude` volume mount (default) or set `OAUTH_TOKEN` in `.env`.
 
 ### Linux (systemd)
 ```bash
@@ -297,9 +332,10 @@ This tests 8 layers independently (credentials, token, API, billing header, trig
 
 **Empty credentials file on Mac / Keychain credentials**
 - Newer Claude Code versions store tokens in macOS Keychain instead of a file
-- The Keychain entry is typically named `Claude Code-credentials`
+- The proxy checks these Keychain service names: `Claude Code-credentials`, `claude-code`, `claude`, `com.anthropic.claude-code`
 - Check manually: `security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null`
 - Run `node setup.js` to auto-extract the Keychain token to `~/.claude/.credentials.json`
+- Run `claude -p "test" --max-turns 1` to force credential write if Keychain is also empty
 - Note: You may need to re-run `node setup.js` after token refresh (~every 24h)
 
 ## Disclaimer

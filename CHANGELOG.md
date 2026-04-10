@@ -1,5 +1,205 @@
 # Changelog
 
+## v2.2.4 -- 2026-04-09
+
+### Fix config strip boundary using filesystem paths instead of AGENTS.md (closes #26)
+
+**Changes:**
+- System strip boundary detection now uses `\n## /` (Linux/macOS) or `\n## C:\\`
+  (Windows) instead of `AGENTS.md` as the end-of-config landmark.
+
+**Why:**
+`AGENTS.md` can appear in skill content (`## Skills (mandatory)` section references
+like "Read AGENTS.md for rules") or in LCM compacted summaries. `indexOf('AGENTS.md')`
+finds the first match, which may be in skill text at ~10K instead of the actual workspace
+doc header at ~28K. Result: config strip is too short, leaving enough template content
+for detection to trigger.
+
+Workspace doc headers always start with a filesystem path (`## /home/...` on Linux,
+`## C:\Users\...` on Windows). These patterns don't appear in skill or summary content.
+
+---
+
+## v2.2.3 -- 2026-04-09
+
+### Add media generation tool renames for OpenClaw 2026.4.5+ (closes #21)
+
+**Changes:**
+- Added `image_generate` → `ImageCreate`, `music_generate` → `MusicCreate`,
+  `video_generate` → `VideoCreate` to `DEFAULT_TOOL_RENAMES`.
+
+**Why:**
+OpenClaw v2026.4.5 introduced 3 new media generation tools not in the proxy's
+default rename list. These tool names are fingerprinted by Anthropic's detection,
+causing requests to be billed as extra usage. Reported and confirmed by a user
+who manually added the renames and saw billing switch from overage to subscription.
+
+Users on OpenClaw 2026.4.5+ who pull the latest proxy get these renames
+automatically via the v2.2.2 merge semantics.
+
+---
+
+## v2.2.2 -- 2026-04-09
+
+### Merge config.json patterns with defaults instead of overriding (closes #24)
+
+**Changes:**
+- **Merge semantics for all pattern arrays.** `config.json` patterns now MERGE with
+  `proxy.js` defaults instead of replacing them. Defaults are applied first, then config
+  entries override (same trigger key) or add (new trigger key). This prevents stale
+  `config.json` snapshots from silently masking new default patterns added in updates.
+- **`setup.js` no longer writes pattern arrays to config.json.** Only `port` and
+  `credentialsPath` are written. Pattern defaults live in `proxy.js` and stay current
+  across `git pull` updates. Custom patterns can be added to `config.json` and will
+  be merged automatically.
+- **Startup note** when config.json has fewer patterns than defaults, showing the merge
+  result so users know their config was supplemented.
+- **Opt-out:** Set `"mergeDefaults": false` in config.json for full manual control
+  (patterns in config.json replace defaults entirely, like v2.1 behavior).
+
+**Why:**
+`setup.js` wrote a frozen snapshot of its pattern arrays to `config.json` at install
+time. After `git pull` to v2.x, the 20+ new critical patterns (`HEARTBEAT`, `billing
+proxy`, `third-party`, `clawhub`, tool renames, property renames) were silently skipped
+because `config.replacements || DEFAULT_REPLACEMENTS` used the stale config. Every user
+who installed before v2.0 was affected.
+
+---
+
+## v2.2.1 -- 2026-04-09
+
+### Fix system strip and tool description stripping on Linux/macOS
+
+**Changes:**
+- **System strip now anchored to system array.** Previously searched from position 0
+  in the body, matching the identity line in conversation history (from prior discussions
+  about the proxy) instead of the actual system prompt. On bodies with accumulated
+  conversation history, the strip either failed silently or stripped the wrong region.
+  Now searches from `"system":[` forward, guaranteeing it finds the config section in
+  the system prompt.
+- **`findMatchingBracket` is now string-aware.** Previously counted raw `[`/`]` characters
+  including those inside JSON string values (tool descriptions, text content). Brackets
+  like `[optional]` or `[array]` in descriptions corrupted the depth count, causing the
+  tools array boundary to be detected at the wrong position. Tool description stripping
+  then silently failed. Now skips brackets inside quoted strings.
+
+**Impact:** These two bugs made the proxy fail on Linux/macOS (and any setup where
+conversation history contained references to "personal assistant"). The system config
+template (~18-28K) was never stripped, and tool descriptions were never removed,
+leaving enough fingerprint signal for Anthropic's detection to trigger.
+
+---
+
+## v2.2.0 -- 2026-04-09
+
+### Docker Compose support + env-var credentials + transfer-encoding fix
+
+**Changes:**
+- **Docker deployment**: Added `Dockerfile` (node:18-alpine), `docker-compose.yml` with health
+  check, credential volume mount (read-only), localhost-only port binding, and log rotation.
+  Added `.dockerignore` and `.env.example`.
+- **OAUTH_TOKEN env var**: Alternative to file-based credentials for Docker and CI environments.
+  Set `OAUTH_TOKEN=sk-ant-...` in `.env` to skip credential file lookup entirely.
+- **PROXY_PORT / PROXY_HOST env vars**: Override port and bind address without config files.
+  Docker Compose sets `PROXY_HOST=0.0.0.0` automatically for container port mapping.
+- **Transfer-Encoding header fix**: Strips `transfer-encoding` from all 3 response paths
+  (error, SSE, JSON) before setting `content-length`, preventing Node.js HTTP parse errors
+  when both headers are present.
+- **Config.json error handling**: Explicit `--config` failure exits with error. Implicit
+  `config.json` failure warns and continues with defaults.
+- **troubleshoot.js**: Guards undefined `e2e.body`, supports v2.0+ health endpoint format.
+
+**Cherry-picked from:** PR #13 (VibeSparkingAI). Docker files taken directly, proxy.js
+changes manually integrated into our v2.1 codebase to preserve tail buffer, StringDecoder,
+escaped reverse mapping, and prefill stripping.
+
+---
+
+## v2.1.3 -- 2026-04-09
+
+### Tail-buffer SSE reverse mapping for chunk boundary splits
+
+**Changes:**
+- SSE streaming handler now keeps a 64-byte tail buffer between TCP chunks before
+  applying `reverseMap()`. Prevents sanitized patterns (e.g. `ocplatform`) from being
+  split across chunk boundaries (`ocp` + `latform`) and leaking through un-reversed.
+- On `end`, remaining tail is flushed through `reverseMap()`.
+- `TAIL_SIZE=64` is >= longest current pattern (24 chars) with 2.5x headroom.
+
+**Why:**
+TCP chunks are arbitrary. A reverse mapping pattern can be split across two `data`
+events. The previous code called `reverseMap()` on each chunk individually, so
+neither half matched the full pattern. In OpenClaw this manifested as workspace
+paths like `.ocplatform/` leaking through instead of `.openclaw/`, causing `ENOENT`
+on tool calls.
+
+**Inspired by:** PR #15 (kokoima) which identified the bug and provided the
+tail-buffer approach.
+
+---
+
+## v2.1.2 -- 2026-04-09
+
+### Fix escaped JSON reverse mapping in SSE tool_use args (closes #11)
+
+**Changes:**
+- `reverseMap()` now handles both plain (`"Name"`) and escaped (`\"Name\"`) quote
+  forms when reversing tool name and property name renames.
+- SSE `input_json_delta` events embed tool arguments inside a `partial_json` string
+  field where inner quotes are escaped. Without the escaped variant, renamed arg keys
+  like `\"SendMessage\"` were never reverted to `\"message\"`, causing OpenClaw's tool
+  runtime to fail with "message required".
+
+**Inspired by:** PR #16 (kokoima) which identified the bug and provided the fix approach.
+
+---
+
+## v2.1.1 -- 2026-04-09
+
+### Strip trailing assistant prefill (Opus 4.6 compatibility)
+
+**Changes:**
+- Added Layer 8: raw-string trailing assistant message stripping. Opus 4.6 disabled
+  assistant message prefill — OpenClaw sometimes pre-fills the next assistant turn
+  to resume interrupted responses, causing permanent 400 errors for the session.
+- Uses string-aware forward scanning with bracket depth tracking (handles braces
+  and quotes inside text content). Zero JSON.parse/stringify — body bytes preserved.
+- Enabled by default. Opt-out: `"stripTrailingAssistantPrefill": false` in config.json.
+
+**Why:**
+When OpenClaw pre-fills a trailing assistant message, Anthropic returns:
+`"This model does not support assistant message prefill. The conversation must end
+with a user message."` The prefill stays in conversation history, so every retry
+fails the same way and the channel becomes permanently stuck.
+
+**Inspired by:** PR #17 (kokoima) which identified the bug. Our implementation uses
+raw string manipulation instead of JSON.parse to avoid re-serialization risks on
+large bodies.
+
+---
+
+## v2.1.0 -- 2026-04-09
+
+### Cherry-pick CC signature emulation + remove image rename collision
+
+**Changes:**
+- Dynamic billing fingerprint: SHA256-based 3-char hash matching real CC's
+  `utils/fingerprint.ts`, computed per-request from first user message
+- Updated CC version to 2.1.97, entrypoint changed from `sdk-cli` to `cli`
+- Stainless SDK headers: `x-stainless-arch/lang/os/package-version/runtime` etc.
+- CC identity headers: `user-agent`, `x-app`, `x-claude-code-session-id`
+- Request metadata injection: `device_id` + `session_id` in CC format
+- Updated beta flags: added `advanced-tool-use-2025-11-20`, `fast-mode-2026-02-01`
+- Strips `x-session-affinity` header (non-CC leak)
+- **Removed `image` → `ImageGen` tool rename** (PR #19, kokoima): collided with
+  Anthropic's `"type":"image"` content block tag, causing permanent session failures
+  when conversation history contained images
+
+**Inspired by:** PR #12 (marco-jardim) for fingerprint hash, Stainless headers,
+updated CC version. PR #19 (kokoima) for the image rename collision fix.
+
+---
+
 ## v2.0.0 -- 2026-04-08
 
 ### Defeat Anthropic's upgraded detection (tool-name fingerprinting + template matching)
